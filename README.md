@@ -1,3 +1,8 @@
+# Lightweight DFormer v2
+见 doc 目录下的文档，也可以见知乎专栏：https://www.zhihu.com/column/c_2044365965798929294
+
+
+
 # <p align=center>`DFormer for RGBD Semantic Segmentation`</p>
 
 非常荣幸我们收到3D视觉工坊的邀请，我们在6月19日晚上19:00开展了关于DFormerv2的论文直播，有兴趣的同学可以观看[直播回放](https://www.bilibili.com/video/BV1hGNozuEe4?t=4.2)，有问题欢迎在这个项目下提issue交流讨论，直播用到的PPT可以在这里下载[BaiduNetDisk](https://pan.baidu.com/s/1HjmiVBYZSnBGcPDJgfCeoA?pwd=ti6p)。
@@ -232,13 +237,14 @@ bash infer.sh
 **5. FLOPs & Parameters.**
 
 ```
-PYTHONPATH="$(dirname $0)/..":$PYTHONPATH python benchmark.py --config local_configs.NYUDepthv2.DFormer_Large
+PYTHONPATH="$(dirname $0)":$PYTHONPATH python utils/benchmark.py --config local_configs.NYUDepthv2.DFormerv2_S
+
 ```
 
 **6. Latency.**
 
 ```
-PYTHONPATH="$(dirname $0)/..":$PYTHONPATH python utils/latency.py --config local_configs.NYUDepthv2.DFormer_Large
+PYTHONPATH="$(dirname $0)":$PYTHONPATH python utils/latency.py --config local_configs.NYUDepthv2.DFormerv2_S
 ```
 
 ps: The latency highly depends on the devices. It is recommended to compare the latency on the same devices. 
