@@ -588,7 +588,7 @@ class dformerv2(nn.Module):
         if isinstance(pretrained, str):
             self.apply(_init_weights)
             # logger = get_root_logger()
-            _state_dict = torch.load(pretrained)
+            _state_dict = torch.load(pretrained, weights_only=False)
             if "model" in _state_dict.keys():
                 _state_dict = _state_dict["model"]
             if "state_dict" in _state_dict.keys():
@@ -657,6 +657,27 @@ def DFormerv2_S(pretrained=False, **kwargs):
     )
     return model
 
+def DFormerv2_S_Lite_ham(pretrained=False, **kwargs):
+    model = dformerv2(
+        embed_dims=[64, 128, 256, 512],
+        depths=[2, 4, 12, 3],
+        num_heads=[4, 4, 8, 16],
+        heads_ranges=[4, 4, 6, 6],
+        mlp_ratios=[4, 4, 3, 3],
+        **kwargs,
+    )
+    return model
+
+def DFormerv2_S_Lite_mlp(pretrained=False, **kwargs):
+    model = dformerv2(
+        embed_dims=[64, 128, 256, 512],
+        depths=[2, 4, 12, 3],
+        num_heads=[4, 4, 8, 16],
+        heads_ranges=[4, 4, 6, 6],
+        mlp_ratios=[4, 4, 3, 3],
+        **kwargs,
+    )
+    return model
 
 def DFormerv2_B(pretrained=False, **kwargs):
     model = dformerv2(

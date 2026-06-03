@@ -1,4 +1,5 @@
 import argparse
+import copy
 import datetime
 import os
 import pprint
@@ -14,21 +15,19 @@ from torch.nn.parallel import DistributedDataParallel
 from val_mm import evaluate, evaluate_msf
 
 from models.builder import EncoderDecoder as segmodel
+from models.distiller import RGBDDistiller
 from utils.dataloader.dataloader import get_train_loader, get_val_loader
 from utils.dataloader.RGBXDataset import RGBXDataset
 from utils.engine.engine import Engine
 from utils.engine.logger import get_logger
-from utils.init_func import configure_optimizers, group_weight
+from utils.init_func import group_weight
 from utils.lr_policy import WarmUpPolyLR
-from utils.pyt_utils import all_reduce_tensor
-
-# from eval import evaluate_mid
+from utils.pyt_utils import all_reduce_tensor, load_model
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--config", help="train config file path")
+parser.add_argument("--config", help="distill config file path")
 parser.add_argument("--gpus", default=2, type=int, help="used gpu number")
-# parser.add_argument('-d', '--devices', default='0,1', type=str)
 parser.add_argument("-v", "--verbose", default=False, action="store_true")
 parser.add_argument("--epochs", default=0)
 parser.add_argument("--show_image", "-s", default=False, action="store_true")
@@ -45,18 +44,19 @@ parser.add_argument("--val_amp", default=True, action=argparse.BooleanOptionalAc
 parser.add_argument("--pad_SUNRGBD", default=False, action=argparse.BooleanOptionalAction)
 parser.add_argument("--use_seed", default=True, action=argparse.BooleanOptionalAction)
 parser.add_argument("--local-rank", default=0)
-# parser.add_argument('--save_path', '-p', default=None)
 
-# os.environ['MASTER_PORT'] = '169710'
 torch.set_float32_matmul_precision("high")
 import torch._dynamo
 
 torch._dynamo.config.suppress_errors = True
-# torch._dynamo.config.automatic_dynamic_shapes = False
 
 
 def is_eval(epoch, config):
-    return epoch > int(config.checkpoint_start_epoch) or epoch == 1 or epoch % 10 == 0
+    ret = False
+    if (epoch > int(config.checkpoint_start_epoch)):
+        if (epoch % config.checkpoint_step == 0):
+            ret = True
+    return ret
 
 
 class gpu_timer:
@@ -73,7 +73,7 @@ class gpu_timer:
 
     def stop(self):
         if self.start_time is None:
-            print("Use start() before stop(). ")
+            return
         torch.cuda.synchronize()
         self.stop_time = time.perf_counter()
         elapsed = self.stop_time - self.start_time
@@ -86,33 +86,48 @@ class gpu_timer:
 
 
 def set_seed(seed):
-    # seed init.
     random.seed(seed)
     np.random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
 
-    # torch seed init.
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.enabled = True  # train speed is slower after enabling this opts.
-
-    # https://pytorch.org/docs/stable/generated/torch.use_deterministic_algorithms.html
+    torch.backends.cudnn.enabled = True
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-
-    # avoiding nondeterministic algorithms (see https://pytorch.org/docs/stable/notes/randomness.html)
     torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def load_teacher_student_weights(student, teacher, config, logger):
+    teacher_weight = getattr(config, "teacher_weight", None)
+    if teacher_weight is None or not os.path.exists(teacher_weight):
+        raise FileNotFoundError(f"teacher_weight is missing or does not exist: {teacher_weight}")
+
+    logger.info(f"load teacher weight from {teacher_weight}")
+    load_model(teacher, teacher_weight, is_restore=False)
+
+    student_weight = getattr(config, "student_weight", None)
+    if student_weight is not None:
+        if not os.path.exists(student_weight):
+            raise FileNotFoundError(f"student_weight does not exist: {student_weight}")
+        logger.info(f"load student weight from {student_weight}")
+        load_model(student, student_weight, is_restore=False)
+    else:
+        logger.info("student_weight is None, using student config initialization only")
 
 
 with Engine(custom_parser=parser) as engine:
     args = parser.parse_args()
-
-    config = getattr(import_module(args.config), "C")
+    config = copy.deepcopy(getattr(import_module(args.config), "C"))
     logger = get_logger(config.log_dir, config.log_file, rank=engine.local_rank)
-    # check if pad_SUNRGBD is used correctly
+
+    if args.compile:
+        logger.warning("torch.compile is disabled in distill training to keep teacher/student path stable")
+        args.compile = False
+
     if args.pad_SUNRGBD and config.dataset_name != "SUNRGBD":
         args.pad_SUNRGBD = False
         logger.warning("pad_SUNRGBD is only used for SUNRGBD dataset")
@@ -121,6 +136,7 @@ with Engine(custom_parser=parser) as engine:
     if (not args.pad_SUNRGBD) and config.backbone.startswith("DFormerv2") and config.dataset_name == "SUNRGBD":
         raise ValueError("DFormerv2 is not recommended without pad_SUNRGBD")
     config.pad = args.pad_SUNRGBD
+
     if args.use_seed:
         set_seed(config.seed)
         logger.info(f"set seed {config.seed}")
@@ -129,39 +145,12 @@ with Engine(custom_parser=parser) as engine:
         torch.backends.cudnn.benchmark = True
         logger.info("use random seed")
 
-    # assert not (args.compile and args.syncbn), "syncbn is not supported in compile mode"
-    if not args.compile and args.compile_mode != "default":
-        logger.warning("compile_mode is only valid when compile is enabled, ignoring compile_mode")
-
     train_loader, train_sampler = get_train_loader(engine, RGBXDataset, config)
-
-    if args.gpus == 2:
-        if args.mst and args.compile and args.compile_mode == "reduce-overhead":
-            val_dl_factor = 0.25
-        elif args.mst and not args.val_amp:
-            val_dl_factor = 1.5
-        elif args.mst and args.val_amp:
-            val_dl_factor = 1.3
-        else:
-            val_dl_factor = 2
-    elif args.gpus == 4:
-        if args.mst and args.compile and args.compile_mode == "reduce-overhead":
-            val_dl_factor = 0.25
-        elif args.mst and not args.val_amp:
-            val_dl_factor = 1.5
-        elif args.mst and args.val_amp:
-            val_dl_factor = 0.6
-        else:
-            val_dl_factor = 2
-    else:
-        val_dl_factor = 1.5
-
-    val_dl_factor = 1  # TODO: remove this line
     val_loader, val_sampler = get_val_loader(
         engine,
         RGBXDataset,
         config,
-        val_batch_size=int(config.batch_size * val_dl_factor) if config.dataset_name != "SUNRGBD" else int(args.gpus),
+        val_batch_size=int(config.batch_size) if config.dataset_name != "SUNRGBD" else int(args.gpus),
     )
     logger.info(f"val dataset len:{len(val_loader) * int(args.gpus)}")
 
@@ -178,7 +167,6 @@ with Engine(custom_parser=parser) as engine:
         logger.info(k + ": " + str(args.__dict__[k]))
 
     criterion = nn.CrossEntropyLoss(reduction="none", ignore_index=config.background)
-
     if args.syncbn:
         BatchNorm2d = nn.SyncBatchNorm
         logger.info("using syncbn")
@@ -186,26 +174,40 @@ with Engine(custom_parser=parser) as engine:
         BatchNorm2d = nn.BatchNorm2d
         logger.info("using regular bn")
 
-    model = segmodel(
+    teacher_cfg = copy.deepcopy(getattr(import_module(config.teacher_config), "C"))
+
+    student = segmodel(
         cfg=config,
         criterion=criterion,
         norm_layer=BatchNorm2d,
         syncbn=args.syncbn,
     )
-    # weight=torch.load('checkpoints/NYUv2_DFormer_Large.pth')['model']
-    # w_list=list(weight.keys())
-    # # for k in w_list:
-    # #     weight[k[7:]] = weight[k]
-    # print('load model')
-    # model.load_state_dict(weight)
+    teacher = segmodel(
+        cfg=teacher_cfg,
+        criterion=criterion,
+        norm_layer=BatchNorm2d,
+        syncbn=args.syncbn,
+    )
+    load_teacher_student_weights(student, teacher, config, logger)
+
+    model = RGBDDistiller(
+        student=student,
+        teacher=teacher,
+        criterion=criterion,
+        background=config.background,
+        kd_weight=config.kd_weight,
+        feat_weight=config.feat_weight,
+        temperature=config.kd_temperature,
+        feat_indices=config.feat_indices,
+        student_feat_channels=getattr(config, "student_feat_channels", None),
+        teacher_feat_channels=getattr(config, "teacher_feat_channels", None),
+    )
 
     base_lr = config.lr
-    if engine.distributed:
-        base_lr = config.lr
-
     params_list = []
-    params_list = group_weight(params_list, model, BatchNorm2d, base_lr)
-    # params_list = configure_optimizers(model, base_lr, config.weight_decay)
+    params_list = group_weight(params_list, model.student, BatchNorm2d, base_lr)
+    if hasattr(model, "adapters") and len(getattr(model, "adapters")) > 0:
+        params_list = group_weight(params_list, model.adapters, BatchNorm2d, base_lr)
 
     if config.optimizer == "AdamW":
         optimizer = torch.optim.AdamW(
@@ -231,8 +233,9 @@ with Engine(custom_parser=parser) as engine:
         total_iteration,
         config.niters_per_epoch * config.warm_up_epoch,
     )
+
     if engine.distributed:
-        logger.info(".............distributed training.............")
+        logger.info(".............distributed distill training.............")
         if torch.cuda.is_available():
             model.cuda()
             model = DistributedDataParallel(
@@ -250,145 +253,98 @@ with Engine(custom_parser=parser) as engine:
         engine.restore_checkpoint()
 
     optimizer.zero_grad()
+    logger.info("begin distill trainning:")
 
-    logger.info("begin trainning:")
-    data_setting = {
-        "rgb_root": config.rgb_root_folder,
-        "rgb_format": config.rgb_format,
-        "gt_root": config.gt_root_folder,
-        "gt_format": config.gt_format,
-        "transform_gt": config.gt_transform,
-        "x_root": config.x_root_folder,
-        "x_format": config.x_format,
-        "x_single_channel": config.x_is_single_channel,
-        "class_names": config.class_names,
-        "train_source": config.train_source,
-        "eval_source": config.eval_source,
-    }
-    # val_pre = ValPre()
-    # val_dataset = RGBXDataset(data_setting, 'val', val_pre)
-    # test_loader, test_sampler = get_test_loader(engine, RGBXDataset,config)
-    all_dev = [0]
-    # segmentor = SegEvaluator(val_dataset, config.num_classes, config.norm_mean,
-    #                                 config.norm_std, None,
-    #                                 config.eval_scale_array, config.eval_flip,
-    #                                 all_dev, config,args.verbose, args.save_path,args.show_image)
-    uncompiled_model = model
-    if args.compile:
-        compiled_model = torch.compile(model, backend="inductor", mode=args.compile_mode)
-    else:
-        compiled_model = model
-    miou, best_miou = 0.0, 0.0
     train_timer = gpu_timer()
     eval_timer = gpu_timer()
+    miou, best_miou = 0.0, 0.0
+    scaler = torch.cuda.amp.GradScaler() if args.amp else None
 
-    if args.amp:
-        scaler = torch.cuda.amp.GradScaler()
     for epoch in range(engine.state.epoch, config.nepochs + 1):
-        model = compiled_model
         model.train()
         if engine.distributed:
             train_sampler.set_epoch(epoch)
-        # bar_format = "{desc}[{elapsed}<{remaining},{rate_fmt}]"
-        # pbar = tqdm(
-        #     range(config.niters_per_epoch),
-        #     file=sys.stdout,
-        #     bar_format=bar_format,
-        #     # range(5),
-        #     # file=sys.stdout,
-        #     # bar_format=bar_format,
-        # )
-        dataloader = iter(train_loader)
 
-        sum_loss = 0
-        i = 0
+        dataloader = iter(train_loader)
+        sum_loss = 0.0
+        sum_seg_loss = 0.0
+        sum_kd_loss = 0.0
+        sum_feat_loss = 0.0
         train_timer.start()
+
         for idx in range(config.niters_per_epoch):
             engine.update_iteration(epoch, idx)
-
-            # minibatch = dataloader.next()
             minibatch = next(dataloader)
-            imgs = minibatch["data"]
-            gts = minibatch["label"]
-            modal_xs = minibatch["modal_x"]
-
-            imgs = imgs.cuda(non_blocking=True)
-            gts = gts.cuda(non_blocking=True)
-            modal_xs = modal_xs.cuda(non_blocking=True)
+            imgs = minibatch["data"].cuda(non_blocking=True)
+            gts = minibatch["label"].cuda(non_blocking=True)
+            modal_xs = minibatch["modal_x"].cuda(non_blocking=True)
 
             if args.amp:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    loss = model(imgs, modal_xs, gts)
+                    loss_dict = model(imgs, modal_xs, gts)
+                    loss = loss_dict["loss"]
             else:
-                loss = model(imgs, modal_xs, gts)
+                loss_dict = model(imgs, modal_xs, gts)
+                loss = loss_dict["loss"]
 
-            # reduce the whole loss over multi-gpu
             if engine.distributed:
-                reduce_loss = all_reduce_tensor(loss, world_size=engine.world_size)
+                reduce_loss = all_reduce_tensor(loss.detach(), world_size=engine.world_size)
+                reduce_seg_loss = all_reduce_tensor(loss_dict["seg_loss"], world_size=engine.world_size)
+                reduce_kd_loss = all_reduce_tensor(loss_dict["kd_loss"], world_size=engine.world_size)
+                reduce_feat_loss = all_reduce_tensor(loss_dict["feat_loss"], world_size=engine.world_size)
+            else:
+                reduce_loss = loss.detach()
+                reduce_seg_loss = loss_dict["seg_loss"]
+                reduce_kd_loss = loss_dict["kd_loss"]
+                reduce_feat_loss = loss_dict["feat_loss"]
 
             if args.amp:
-                # Scales loss. Calls ``backward()`` on scaled loss to create scaled gradients.
                 scaler.scale(loss).backward()
-                # otherwise, optimizer.step() is skipped.
                 scaler.step(optimizer)
-                # Updates the scale for next iteration.
                 scaler.update()
-                optimizer.zero_grad(set_to_none=True)  # TODO: check if set_to_none=True impact the performance
+                optimizer.zero_grad(set_to_none=True)
             else:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-            if not args.amp:
-                if epoch == 1:
-                    for name, param in model.named_parameters():
-                        if param.grad is None:
-                            logger.warning(f"{name} has no grad, please check")
-
             current_idx = (epoch - 1) * config.niters_per_epoch + idx
             lr = lr_policy.get_lr(current_idx)
-
             for i in range(len(optimizer.param_groups)):
                 optimizer.param_groups[i]["lr"] = lr
 
-            if engine.distributed:
-                sum_loss += reduce_loss.item()
-                print_str = (
-                    "Epoch {}/{}".format(epoch, config.nepochs)
-                    + " Iter {}/{}:".format(idx + 1, config.niters_per_epoch)
-                    + " lr=%.4e" % lr
-                    + " loss=%.4f total_loss=%.4f" % (reduce_loss.item(), (sum_loss / (idx + 1)))
-                )
-
-            else:
-                sum_loss += loss
-                print_str = (
-                    f"Epoch {epoch}/{config.nepochs} "
-                    + f"Iter {idx + 1}/{config.niters_per_epoch}: "
-                    + f"lr={lr:.4e} loss={loss:.4f} total_loss={(sum_loss / (idx + 1)):.4f}"
-                )
+            sum_loss += reduce_loss.item()
+            sum_seg_loss += reduce_seg_loss.item()
+            sum_kd_loss += reduce_kd_loss.item()
+            sum_feat_loss += reduce_feat_loss.item()
+            print_str = (
+                f"Epoch {epoch}/{config.nepochs} "
+                + f"Iter {idx + 1}/{config.niters_per_epoch}: "
+                + f"lr={lr:.4e} "
+                + f"loss={reduce_loss.item():.4f} "
+                + f"seg={reduce_seg_loss.item():.4f} "
+                + f"kd={reduce_kd_loss.item():.4f} "
+                + f"feat={reduce_feat_loss.item():.4f} "
+                + f"avg_loss={(sum_loss / (idx + 1)):.4f}"
+            )
 
             if ((idx + 1) % int((config.niters_per_epoch) * 0.1) == 0 or idx == 0) and (
                 (engine.distributed and (engine.local_rank == 0)) or (not engine.distributed)
             ):
                 print(print_str)
 
-            del loss
-            # pbar.set_description(print_str, refresh=False)
         logger.info(print_str)
         train_timer.stop()
 
-        # if (engine.distributed and (engine.local_rank == 0)) or (
-        #     not engine.distributed
-        # ):
-        #     tb.add_scalar("train_loss", sum_loss / len(pbar), epoch)
+        if (engine.distributed and engine.local_rank == 0) or (not engine.distributed):
+            tb.add_scalar("train/total_loss", sum_loss / config.niters_per_epoch, epoch)
+            tb.add_scalar("train/seg_loss", sum_seg_loss / config.niters_per_epoch, epoch)
+            tb.add_scalar("train/kd_loss", sum_kd_loss / config.niters_per_epoch, epoch)
+            tb.add_scalar("train/feat_loss", sum_feat_loss / config.niters_per_epoch, epoch)
 
         if is_eval(epoch, config):
             eval_timer.start()
             torch.cuda.empty_cache()
-            # if args.compile and args.mst and (not args.sliding):
-            #     model = uncompiled_model
-            # TODO: FIX this
             if engine.distributed:
                 with torch.no_grad():
                     model.eval()
@@ -407,14 +363,7 @@ with Engine(custom_parser=parser) as engine:
                                     sliding=args.sliding,
                                 )
                             else:
-                                all_metrics = evaluate(
-                                    model,
-                                    val_loader,
-                                    config,
-                                    device,
-                                    engine,
-                                    sliding=args.sliding,
-                                )
+                                all_metrics = evaluate(model, val_loader, config, device, engine, sliding=args.sliding)
                     else:
                         if args.mst:
                             all_metrics = evaluate_msf(
@@ -428,21 +377,12 @@ with Engine(custom_parser=parser) as engine:
                                 sliding=args.sliding,
                             )
                         else:
-                            all_metrics = evaluate(
-                                model,
-                                val_loader,
-                                config,
-                                device,
-                                engine,
-                                sliding=args.sliding,
-                            )
+                            all_metrics = evaluate(model, val_loader, config, device, engine, sliding=args.sliding)
                     if engine.local_rank == 0:
                         metric = all_metrics[0]
                         for other_metric in all_metrics[1:]:
                             metric.update_hist(other_metric.hist)
                         ious, miou = metric.compute_iou()
-                        acc, macc = metric.compute_pixel_acc()
-                        f1, mf1 = metric.compute_f1()
                         if miou > best_miou:
                             best_miou = miou
                             engine.save_and_link_checkpoint(
@@ -453,7 +393,7 @@ with Engine(custom_parser=parser) as engine:
                                 metric=miou,
                             )
                         print("miou", miou, "best", best_miou)
-            elif not engine.distributed:
+            else:
                 with torch.no_grad():
                     model.eval()
                     device = torch.device("cuda")
@@ -471,14 +411,7 @@ with Engine(custom_parser=parser) as engine:
                                     sliding=args.sliding,
                                 )
                             else:
-                                metric = evaluate(
-                                    model,
-                                    val_loader,
-                                    config,
-                                    device,
-                                    engine,
-                                    sliding=args.sliding,
-                                )
+                                metric = evaluate(model, val_loader, config, device, engine, sliding=args.sliding)
                     else:
                         if args.mst:
                             metric = evaluate_msf(
@@ -492,20 +425,8 @@ with Engine(custom_parser=parser) as engine:
                                 sliding=args.sliding,
                             )
                         else:
-                            metric = evaluate(
-                                model,
-                                val_loader,
-                                config,
-                                device,
-                                engine,
-                                sliding=args.sliding,
-                            )
+                            metric = evaluate(model, val_loader, config, device, engine, sliding=args.sliding)
                     ious, miou = metric.compute_iou()
-                    acc, macc = metric.compute_pixel_acc()
-                    f1, mf1 = metric.compute_f1()
-                    # print('miou',miou)
-                # print('acc, macc, f1, mf1, ious, miou',acc, macc, f1, mf1, ious, miou)
-                # print('miou',miou)
                 if miou > best_miou:
                     best_miou = miou
                     engine.save_and_link_checkpoint(
@@ -516,7 +437,10 @@ with Engine(custom_parser=parser) as engine:
                         metric=miou,
                     )
                 print("miou", miou, "best", best_miou)
+
             logger.info(f"Epoch {epoch} validation result: mIoU {miou}, best mIoU {best_miou}")
+            if (engine.distributed and engine.local_rank == 0) or (not engine.distributed):
+                tb.add_scalar("val/mIoU", miou, epoch)
             eval_timer.stop()
 
         eval_count = 0

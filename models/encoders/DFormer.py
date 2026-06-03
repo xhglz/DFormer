@@ -285,7 +285,7 @@ class DFormer(BaseModule):
         #     self.add_module(layer_name, layer)
 
     def init_weights(self, pretrained):
-        _state_dict = torch.load(pretrained)
+        _state_dict = torch.load(pretrained, weights_only=False)
         if "state_dict_ema" in _state_dict.keys():
             _state_dict = _state_dict["state_dict_ema"]
         else:

@@ -10,6 +10,7 @@ from models.builder import EncoderDecoder as segmodel
 from tensorboardX import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel
 from val_mm import evaluate, evaluate_msf
+from utils.pyt_utils import load_model
 
 from utils.dataloader.dataloader import get_val_loader
 from utils.dataloader.RGBXDataset import RGBXDataset
@@ -113,14 +114,8 @@ with Engine(custom_parser=parser) as engine:
         syncbn=args.syncbn,
     )
 
-    weight = torch.load(args.continue_fpath, map_location=torch.device("cpu"))
-    if "model" in weight:
-        weight = weight["model"]
-    elif "state_dict" in weight:
-        weight = weight["state_dict"]
-
     logger.info(f"load model from {args.continue_fpath}")
-    print(model.load_state_dict(weight, strict=False))
+    load_model(model, args.continue_fpath, is_restore=False)
 
     if engine.distributed:
         logger.info(".............distributed training.............")

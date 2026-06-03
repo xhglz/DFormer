@@ -137,7 +137,7 @@ def load_restore_model(model, model_file):
         return model
 
     if isinstance(model_file, str):
-        state_dict = torch.load(model_file)
+        state_dict = torch.load(model_file, weights_only=False)
         if "model" in state_dict.keys():
             state_dict = state_dict["model"]
         elif "state_dict" in state_dict.keys():
@@ -166,7 +166,7 @@ def load_model(model, model_file, is_restore=False):
         return model
 
     if isinstance(model_file, str):
-        state_dict = torch.load(model_file)
+        state_dict = torch.load(model_file, weights_only=False)
         if "model" in state_dict.keys():
             state_dict = state_dict["model"]
         elif "state_dict" in state_dict.keys():
@@ -177,14 +177,31 @@ def load_model(model, model_file, is_restore=False):
         state_dict = model_file
     t_ioend = time.time()
 
-    if is_restore:
-        new_state_dict = OrderedDict()
-        for k, v in state_dict.items():
-            name = "module." + k
-            new_state_dict[name] = v
-        state_dict = new_state_dict
+    if isinstance(state_dict, dict) and state_dict:
+        keys = list(state_dict.keys())
+        module_student_ratio = sum(k.startswith("module.student.") for k in keys) / len(keys)
+        student_ratio = sum(k.startswith("student.") for k in keys) / len(keys)
+        if module_student_ratio > 0.9:
+            state_dict = {
+                "module." + k[len("module.student.") :]: v
+                for k, v in state_dict.items()
+                if k.startswith("module.student.")
+            }
+        elif student_ratio > 0.9:
+            state_dict = {k[len("student.") :]: v for k, v in state_dict.items() if k.startswith("student.")}
 
-    model.load_state_dict(state_dict, strict=True)
+    if is_restore:
+        # check whether model is wrapped in DDP (keys start with "module.")
+        model_keys = list(model.state_dict().keys())
+        if model_keys and model_keys[0].startswith("module."):
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = "module." + k
+                new_state_dict[name] = v
+            state_dict = new_state_dict
+        # if model is not DDP-wrapped, keep original keys (already stripped of "module." prefix)
+
+    model.load_state_dict(state_dict, strict=False)
     ckpt_keys = set(state_dict.keys())
     own_keys = set(model.state_dict().keys())
     missing_keys = own_keys - ckpt_keys

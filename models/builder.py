@@ -98,6 +98,14 @@ class EncoderDecoder(nn.Module):
             from .encoders.DFormerv2 import DFormerv2_S as backbone
 
             self.channels = [64, 128, 256, 512]
+        elif cfg.backbone == "DFormerv2_S_Lite_ham":
+            from .encoders.DFormerv2 import DFormerv2_S_Lite_ham as backbone
+
+            self.channels = [64, 128, 256, 512]
+        elif cfg.backbone == "DFormerv2_S_Lite_mlp":
+            from .encoders.DFormerv2 import DFormerv2_S_Lite_mlp as backbone
+
+            self.channels = [64, 128, 256, 512]
         else:
             raise NotImplementedError
 
