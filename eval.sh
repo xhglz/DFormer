@@ -1,7 +1,7 @@
 # CUDA_VISIBLE_DEVICES=0,1
 # config -> which model config
 # continue_fpath -> the trained pth path
-GPUS=8
+GPUS=1
 NNODES=1
 NODE_RANK=${NODE_RANK:-0}
 PORT=${PORT:-29158}
@@ -9,8 +9,9 @@ MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 export TORCHDYNAMO_VERBOSE=1
+export LD_PRELOAD="$(dirname $0)/stub_itt.so${LD_PRELOAD:+:$LD_PRELOAD}"
 
-PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
+PYTHONPATH="$(dirname $0)":$PYTHONPATH \
     torchrun \
     --nnodes=$NNODES \
     --node_rank=$NODE_RANK \
@@ -28,6 +29,21 @@ PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
     --amp \
     --pad_SUNRGBD \
     --continue_fpath="checkpoints/trained/DFormerv2_Small_NYU.pth"
+
+
+
+
+#   LOCAL_RANK=0 PYTHONPATH=. python utils/eval.py \
+#   --config=local_configs.NYUDepthv2.DFormerv2_S_Lite_mlp \
+#   --gpus=1 \
+#   --continue_fpath=checkpoints/NYUDepthv2_DFormerv2_S_Lite_mlp/epoch-230_miou_51.7.pth \
+#   --no-sliding \
+#   --no-mst \
+#   --amp \
+#   --no-compile \
+#   --no-syncbn \
+#   --no-pad_SUNRGBD
+
 
 # choose the dataset and DFormer for evaluating
 

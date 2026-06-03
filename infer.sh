@@ -1,13 +1,15 @@
 # CUDA_VISIBLE_DEVICES=0,1
 # config -> which model config
 # continue_fpath -> the trained pth path
-GPUS=2
+GPUS=1
 NNODES=1
 NODE_RANK=${NODE_RANK:-0}
 PORT=${PORT:-29958}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
-PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
+export LD_PRELOAD="$(dirname $0)/stub_itt.so${LD_PRELOAD:+:$LD_PRELOAD}"
+
+PYTHONPATH="$(dirname $0)":$PYTHONPATH \
     torchrun \
     --nnodes=$NNODES \
     --node_rank=$NODE_RANK \
@@ -15,8 +17,8 @@ PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
     --nproc_per_node=$GPUS \
     --master_port=$PORT \
     utils/infer.py \
-    --config=local_configs.NYUDepthv2.DFormer_Large \
-    --continue_fpath=checkpoints/trained/NYUv2_DFormer_Large.pth \
+    --config=local_configs.NYUDepthv2.DFormerv2_L \
+    --continue_fpath=checkpoints/trained/DFormerv2_Large_NYU.pth \
     --save_path "output/" \
     --gpus=$GPUS
 
